@@ -3,8 +3,8 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { LyricLine } from "../types";
 
 export const fetchCantoneseData = async (text: string): Promise<LyricLine[]> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  
+  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
   const response = await ai.models.generateContent({
     model: 'gemini-3-flash-preview',
     contents: `

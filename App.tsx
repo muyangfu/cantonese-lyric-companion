@@ -1,23 +1,84 @@
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { fetchCantoneseData } from './services/geminiService';
 import { LyricLine, StyleConfig } from './types';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
 
+// localStorage keys
+const STORAGE_KEYS = {
+  inputText: 'cantonese-lyrics-input',
+  lyricsData: 'cantonese-lyrics-data',
+  style: 'cantonese-lyrics-style'
+};
+
 const App: React.FC = () => {
-  const [inputText, setInputText] = useState('');
-  const [lyricsData, setLyricsData] = useState<LyricLine[]>([]);
+  // 从 localStorage 初始化状态
+  const [inputText, setInputText] = useState(() => {
+    try {
+      return localStorage.getItem(STORAGE_KEYS.inputText) || '';
+    } catch {
+      return '';
+    }
+  });
+
+  const [lyricsData, setLyricsData] = useState<LyricLine[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.lyricsData);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
   const [loading, setLoading] = useState(false);
   const previewRef = useRef<HTMLDivElement>(null);
 
-  const [style, setStyle] = useState<StyleConfig>({
-    pinyin: { show: true, fontSize: 14, color: '#64748b', fontWeight: 'normal' },
-    lyric: { fontSize: 24, color: '#1e293b', fontWeight: 'bold' },
-    homophone: { show: true, fontSize: 14, color: '#94a3b8', fontWeight: 'normal' },
-    lineSpacing: 40,
-    alignment: 'center'
+  // 朗读相关状态
+  const [playingLine, setPlayingLine] = useState<number | null>(null);
+  const [playingUnit, setPlayingUnit] = useState<number>(-1);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const speechRef = useRef<SpeechSynthesisUtterance | null>(null);
+
+  const [style, setStyle] = useState<StyleConfig>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.style);
+      return saved ? JSON.parse(saved) : {
+        pinyin: { show: true, fontSize: 14, color: '#4a6ea8', fontWeight: 'normal' },
+        lyric: { fontSize: 28, color: '#2d3748', fontWeight: 'bold' },
+        homophone: { show: true, fontSize: 14, color: '#718096', fontWeight: 'normal' },
+        lineSpacing: 48,
+        alignment: 'center'
+      };
+    } catch {
+      return {
+        pinyin: { show: true, fontSize: 14, color: '#4a6ea8', fontWeight: 'normal' },
+        lyric: { fontSize: 28, color: '#2d3748', fontWeight: 'bold' },
+        homophone: { show: true, fontSize: 14, color: '#718096', fontWeight: 'normal' },
+        lineSpacing: 48,
+        alignment: 'center'
+      };
+    }
   });
+
+  // 保存数据到 localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.inputText, inputText);
+    } catch { }
+  }, [inputText]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.lyricsData, JSON.stringify(lyricsData));
+    } catch { }
+  }, [lyricsData]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.style, JSON.stringify(style));
+    } catch { }
+  }, [style]);
 
   const handleGenerate = async () => {
     if (!inputText.trim()) return;
@@ -32,181 +93,410 @@ const App: React.FC = () => {
     }
   };
 
+  // 朗读中止标志
+  const abortRef = useRef<boolean>(false);
+
+  // 停止朗读（统一停止逻辑）
+  const stopSpeaking = useCallback(() => {
+    abortRef.current = true;  // 标记中止，让已排队的 setTimeout 回调不再继续
+    window.speechSynthesis.cancel();
+    setPlayingLine(null);
+    setPlayingUnit(-1);
+    setIsPlaying(false);
+  }, []);
+
+  // 单字发音
+  const speakChar = useCallback((char: string) => {
+    // 先完整停止之前的播放
+    stopSpeaking();
+
+    if (!char.trim() || /^[\p{P}\p{S}]$/u.test(char)) return;
+
+    // 重置中止标志（单字发音不需要检查中止）
+    abortRef.current = false;
+
+    const utterance = new SpeechSynthesisUtterance(char);
+    utterance.lang = 'zh-HK';
+    utterance.rate = 0.7;
+    utterance.pitch = 1;
+    window.speechSynthesis.speak(utterance);
+  }, [stopSpeaking]);
+
+  // 检查行是否为空行（没有有效字符）
+  const isEmptyLine = useCallback((line: LyricLine) => {
+    return !line.units.some(unit => unit.char.trim() && !/^[\p{P}\p{S}]$/u.test(unit.char));
+  }, []);
+
+  // 朗读从指定行开始，自动播放到结束
+  const speakFromLine = useCallback((startLineIdx: number) => {
+    // 如果正在播放当前行，则停止
+    if (playingLine === startLineIdx && isPlaying) {
+      stopSpeaking();
+      return;
+    }
+
+    // 停止之前的播放
+    stopSpeaking();
+
+    // 短暂延迟确保状态已清理，然后开始新播放
+    setTimeout(() => {
+      // 重置中止标志，开始新播放
+      abortRef.current = false;
+
+      setPlayingLine(startLineIdx);
+      setPlayingUnit(-1);
+      setIsPlaying(true);
+
+      let currentLineIdx = startLineIdx;
+      let currentUnitIdx = 0;
+
+      const speakNext = () => {
+        // 检查是否被中止
+        if (abortRef.current) {
+          return;
+        }
+
+        // 检查是否超出所有行
+        if (currentLineIdx >= lyricsData.length) {
+          stopSpeaking();
+          return;
+        }
+
+        const line = lyricsData[currentLineIdx];
+
+        // 如果是空行，跳到下一行
+        if (isEmptyLine(line)) {
+          currentLineIdx++;
+          currentUnitIdx = 0;
+          if (!abortRef.current) {
+            setPlayingLine(currentLineIdx);
+            setPlayingUnit(-1);
+          }
+          setTimeout(speakNext, 100);
+          return;
+        }
+
+        // 检查是否超出当前行
+        if (currentUnitIdx >= line.units.length) {
+          // 进入下一行
+          currentLineIdx++;
+          currentUnitIdx = 0;
+          if (!abortRef.current) {
+            setPlayingLine(currentLineIdx);
+            setPlayingUnit(-1);
+          }
+          // 行间稍作停顿
+          setTimeout(speakNext, 300);
+          return;
+        }
+
+        const unit = line.units[currentUnitIdx];
+
+        // 跳过标点符号或空白字符
+        if (!unit.char.trim() || /^[\p{P}\p{S}]$/u.test(unit.char)) {
+          currentUnitIdx++;
+          speakNext();
+          return;
+        }
+
+        if (!abortRef.current) {
+          setPlayingUnit(currentUnitIdx);
+        }
+
+        const utterance = new SpeechSynthesisUtterance(unit.char);
+        utterance.lang = 'zh-HK';
+        utterance.rate = 0.8;
+        utterance.pitch = 1;
+
+        utterance.onend = () => {
+          if (!abortRef.current) {
+            currentUnitIdx++;
+            setTimeout(speakNext, 100);
+          }
+        };
+
+        utterance.onerror = () => {
+          if (!abortRef.current) {
+            currentUnitIdx++;
+            speakNext();
+          }
+        };
+
+        speechRef.current = utterance;
+        window.speechSynthesis.speak(utterance);
+      };
+
+      speakNext();
+    }, 50);  // 短暂延迟确保状态同步
+  }, [lyricsData, playingLine, isPlaying, stopSpeaking, isEmptyLine]);
+
+  // 组件卸载时停止朗读
+  useEffect(() => {
+    return () => {
+      window.speechSynthesis.cancel();
+    };
+  }, []);
+
   const exportAsImage = async () => {
     if (!previewRef.current) return;
-    const canvas = await html2canvas(previewRef.current, {
-      backgroundColor: '#ffffff',
-      scale: 2
-    });
-    const link = document.createElement('a');
-    link.download = 'cantonese-lyrics.png';
-    link.href = canvas.toDataURL('image/png');
-    link.click();
+
+    // 保存原始样式
+    const originalWidth = previewRef.current.style.width;
+    const originalMinWidth = previewRef.current.style.minWidth;
+
+    // 隐藏音频按钮
+    const audioButtons = previewRef.current.querySelectorAll('.audio-btn');
+    const emptyPlaceholders = previewRef.current.querySelectorAll('.no-print');
+    audioButtons.forEach(btn => (btn as HTMLElement).style.display = 'none');
+    emptyPlaceholders.forEach(el => (el as HTMLElement).style.display = 'none');
+
+    // 设置固定宽度以确保布局正确
+    previewRef.current.style.width = '800px';
+    previewRef.current.style.minWidth = '800px';
+
+    try {
+      const canvas = await html2canvas(previewRef.current, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        width: 800,
+        windowWidth: 800
+      });
+      const link = document.createElement('a');
+      link.download = 'cantonese-lyrics.png';
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    } finally {
+      // 恢复原始样式
+      previewRef.current.style.width = originalWidth;
+      previewRef.current.style.minWidth = originalMinWidth;
+      // 恢复音频按钮显示
+      audioButtons.forEach(btn => (btn as HTMLElement).style.display = 'flex');
+      emptyPlaceholders.forEach(el => (el as HTMLElement).style.display = '');
+    }
   };
 
   const exportAsPDF = async () => {
     if (!previewRef.current) return;
-    const canvas = await html2canvas(previewRef.current, {
-      backgroundColor: '#ffffff',
-      scale: 2
-    });
-    const imgData = canvas.toDataURL('image/png');
-    const pdf = new jsPDF('p', 'mm', 'a4');
-    const imgProps = pdf.getImageProperties(imgData);
-    const pdfWidth = pdf.internal.pageSize.getWidth();
-    const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
-    pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
-    pdf.save('cantonese-lyrics.pdf');
+
+    // 保存原始样式
+    const originalWidth = previewRef.current.style.width;
+    const originalMinWidth = previewRef.current.style.minWidth;
+
+    // 隐藏音频按钮
+    const audioButtons = previewRef.current.querySelectorAll('.audio-btn');
+    const emptyPlaceholders = previewRef.current.querySelectorAll('.no-print');
+    audioButtons.forEach(btn => (btn as HTMLElement).style.display = 'none');
+    emptyPlaceholders.forEach(el => (el as HTMLElement).style.display = 'none');
+
+    // 设置固定宽度以确保布局正确
+    previewRef.current.style.width = '800px';
+    previewRef.current.style.minWidth = '800px';
+
+    try {
+      const canvas = await html2canvas(previewRef.current, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        width: 800,
+        windowWidth: 800
+      });
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const imgProps = pdf.getImageProperties(imgData);
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
+      pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
+      pdf.save('cantonese-lyrics.pdf');
+    } finally {
+      // 恢复原始样式
+      previewRef.current.style.width = originalWidth;
+      previewRef.current.style.minWidth = originalMinWidth;
+      // 恢复音频按钮显示
+      audioButtons.forEach(btn => (btn as HTMLElement).style.display = 'flex');
+      emptyPlaceholders.forEach(el => (el as HTMLElement).style.display = '');
+    }
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col">
+    <div className="h-screen flex flex-col overflow-hidden">
       {/* Header */}
-      <header className="bg-white border-b px-6 py-4 flex items-center justify-between sticky top-0 z-10">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-xl">粤</div>
-          <h1 className="text-xl font-bold text-slate-800">粤韵歌词 <span className="text-sm font-normal text-slate-500">Cantonese Companion</span></h1>
+      <header className="app-header px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <div className="logo-icon">粤</div>
+          <div>
+            <h1 className="app-title">粤韵歌词</h1>
+            <p className="app-subtitle">Cantonese Lyric Companion</p>
+          </div>
         </div>
-        <div className="flex gap-2">
-          <button 
+        <div className="flex gap-3">
+          <button
             onClick={exportAsImage}
             disabled={lyricsData.length === 0}
-            className="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 transition-colors"
+            className="btn btn-secondary"
           >
             导出图片
           </button>
-          <button 
+          <button
             onClick={exportAsPDF}
             disabled={lyricsData.length === 0}
-            className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+            className="btn btn-accent"
           >
             导出 PDF
           </button>
         </div>
       </header>
 
-      <main className="flex-1 flex flex-col md:flex-row p-6 gap-6 max-w-7xl mx-auto w-full overflow-hidden">
-        {/* Left Sidebar: Controls */}
-        <div className="w-full md:w-80 flex flex-col gap-6 overflow-y-auto pr-2 no-print">
-          <section className="bg-white p-5 rounded-xl shadow-sm border border-slate-100">
-            <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-4">输入歌词</h2>
+      <main className="flex-1 flex flex-col md:flex-row p-6 gap-6 max-w-7xl mx-auto w-full overflow-hidden animate-stagger" style={{ height: 'calc(100vh - 130px)' }}>
+        {/* Left Sidebar: Controls - 固定不滚动 */}
+        <div className="w-full md:w-80 flex-shrink-0 flex flex-col gap-6 pr-2 no-print" style={{ maxHeight: '100%', overflowY: 'auto' }}>
+          <section className="card p-6">
+            <h2 className="card-header">输入歌词</h2>
             <textarea
-              className="w-full h-40 p-3 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
-              placeholder="请输入中文歌词..."
+              className="input-field h-40 resize-none"
+              placeholder="请输入中文歌词，每行一句..."
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
             />
             <button
               onClick={handleGenerate}
               disabled={loading || !inputText}
-              className="w-full mt-4 bg-indigo-600 text-white py-2.5 rounded-lg font-medium hover:bg-indigo-700 disabled:bg-slate-300 transition-all flex items-center justify-center gap-2"
+              className="btn btn-primary w-full mt-4 flex items-center justify-center gap-2"
             >
               {loading ? (
                 <>
-                  <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                  解析中...
+                  <div className="loading-spinner"></div>
+                  <span>解析中...</span>
                 </>
-              ) : '一键生成注音'}
+              ) : (
+                <>
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                  <span>一键生成注音</span>
+                </>
+              )}
             </button>
           </section>
 
-          <section className="bg-white p-5 rounded-xl shadow-sm border border-slate-100 flex flex-col gap-6">
-            <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider">样式调整</h2>
-            
+          <section className="card p-6 flex flex-col gap-5">
+            <h2 className="card-header">样式调整</h2>
+
             {/* Pinyin Styles */}
             <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-sm font-medium text-slate-700">粤语拼音 (Jyutping)</label>
-                <input 
-                  type="checkbox" 
-                  checked={style.pinyin.show} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, pinyin: { ...prev.pinyin, show: e.target.checked }}))}
-                  className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+              <div className="flex items-center justify-between mb-3">
+                <label className="text-sm font-medium" style={{ color: 'var(--color-charcoal)' }}>
+                  粤语拼音 <span className="text-xs opacity-60">(Jyutping)</span>
+                </label>
+                <input
+                  type="checkbox"
+                  checked={style.pinyin.show}
+                  onChange={(e) => setStyle(prev => ({ ...prev, pinyin: { ...prev.pinyin, show: e.target.checked } }))}
                 />
               </div>
-              <div className="grid grid-cols-2 gap-2">
-                <input 
-                  type="number" 
-                  value={style.pinyin.fontSize} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, pinyin: { ...prev.pinyin, fontSize: Number(e.target.value) }}))}
-                  className="px-2 py-1 text-xs border border-slate-200 rounded"
-                />
-                <input 
-                  type="color" 
-                  value={style.pinyin.color} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, pinyin: { ...prev.pinyin, color: e.target.value }}))}
-                  className="w-full h-8 border border-slate-200 rounded p-1 cursor-pointer"
-                />
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs opacity-60 mb-1 block">字号</label>
+                  <input
+                    type="number"
+                    value={style.pinyin.fontSize}
+                    onChange={(e) => setStyle(prev => ({ ...prev, pinyin: { ...prev.pinyin, fontSize: Number(e.target.value) } }))}
+                    className="input-field text-sm py-2"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs opacity-60 mb-1 block">颜色</label>
+                  <input
+                    type="color"
+                    value={style.pinyin.color}
+                    onChange={(e) => setStyle(prev => ({ ...prev, pinyin: { ...prev.pinyin, color: e.target.value } }))}
+                    className="w-full h-10"
+                  />
+                </div>
               </div>
             </div>
 
             {/* Lyric Styles */}
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-2">歌词本体 (Lyric)</label>
-              <div className="grid grid-cols-2 gap-2">
-                <input 
-                  type="number" 
-                  value={style.lyric.fontSize} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, lyric: { ...prev.lyric, fontSize: Number(e.target.value) }}))}
-                  className="px-2 py-1 text-xs border border-slate-200 rounded"
-                />
-                <input 
-                  type="color" 
-                  value={style.lyric.color} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, lyric: { ...prev.lyric, color: e.target.value }}))}
-                  className="w-full h-8 border border-slate-200 rounded p-1 cursor-pointer"
-                />
+              <label className="text-sm font-medium mb-3 block" style={{ color: 'var(--color-charcoal)' }}>
+                歌词本体 <span className="text-xs opacity-60">(Lyric)</span>
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs opacity-60 mb-1 block">字号</label>
+                  <input
+                    type="number"
+                    value={style.lyric.fontSize}
+                    onChange={(e) => setStyle(prev => ({ ...prev, lyric: { ...prev.lyric, fontSize: Number(e.target.value) } }))}
+                    className="input-field text-sm py-2"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs opacity-60 mb-1 block">颜色</label>
+                  <input
+                    type="color"
+                    value={style.lyric.color}
+                    onChange={(e) => setStyle(prev => ({ ...prev, lyric: { ...prev.lyric, color: e.target.value } }))}
+                    className="w-full h-10"
+                  />
+                </div>
               </div>
             </div>
 
             {/* Homophone Styles */}
             <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-sm font-medium text-slate-700">中文谐音 (Homophone)</label>
-                <input 
-                  type="checkbox" 
-                  checked={style.homophone.show} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, homophone: { ...prev.homophone, show: e.target.checked }}))}
-                  className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+              <div className="flex items-center justify-between mb-3">
+                <label className="text-sm font-medium" style={{ color: 'var(--color-charcoal)' }}>
+                  中文谐音 <span className="text-xs opacity-60">(Homophone)</span>
+                </label>
+                <input
+                  type="checkbox"
+                  checked={style.homophone.show}
+                  onChange={(e) => setStyle(prev => ({ ...prev, homophone: { ...prev.homophone, show: e.target.checked } }))}
                 />
               </div>
-              <div className="grid grid-cols-2 gap-2">
-                <input 
-                  type="number" 
-                  value={style.homophone.fontSize} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, homophone: { ...prev.homophone, fontSize: Number(e.target.value) }}))}
-                  className="px-2 py-1 text-xs border border-slate-200 rounded"
-                />
-                <input 
-                  type="color" 
-                  value={style.homophone.color} 
-                  onChange={(e) => setStyle(prev => ({ ...prev, homophone: { ...prev.homophone, color: e.target.value }}))}
-                  className="w-full h-8 border border-slate-200 rounded p-1 cursor-pointer"
-                />
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs opacity-60 mb-1 block">字号</label>
+                  <input
+                    type="number"
+                    value={style.homophone.fontSize}
+                    onChange={(e) => setStyle(prev => ({ ...prev, homophone: { ...prev.homophone, fontSize: Number(e.target.value) } }))}
+                    className="input-field text-sm py-2"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs opacity-60 mb-1 block">颜色</label>
+                  <input
+                    type="color"
+                    value={style.homophone.color}
+                    onChange={(e) => setStyle(prev => ({ ...prev, homophone: { ...prev.homophone, color: e.target.value } }))}
+                    className="w-full h-10"
+                  />
+                </div>
               </div>
             </div>
 
-            {/* Spacing & Alignment */}
+            {/* Spacing */}
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-2">行间距</label>
-              <input 
-                type="range" min="10" max="100" 
-                value={style.lineSpacing} 
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-sm font-medium" style={{ color: 'var(--color-charcoal)' }}>行间距</label>
+                <span className="text-xs opacity-60">{style.lineSpacing}px</span>
+              </div>
+              <input
+                type="range" min="20" max="100"
+                value={style.lineSpacing}
                 onChange={(e) => setStyle(prev => ({ ...prev, lineSpacing: Number(e.target.value) }))}
-                className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
               />
             </div>
-            
+
+            {/* Alignment */}
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-2">对齐方式</label>
+              <label className="text-sm font-medium mb-2 block" style={{ color: 'var(--color-charcoal)' }}>对齐方式</label>
               <div className="flex gap-2">
                 {(['left', 'center', 'right'] as const).map((align) => (
                   <button
                     key={align}
                     onClick={() => setStyle(prev => ({ ...prev, alignment: align }))}
-                    className={`flex-1 py-1.5 text-xs rounded border transition-all ${
-                      style.alignment === align ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
-                    }`}
+                    className={`align-btn ${style.alignment === align ? 'active' : ''}`}
                   >
                     {align === 'left' ? '左对齐' : align === 'center' ? '居中' : '右对齐'}
                   </button>
@@ -216,77 +506,159 @@ const App: React.FC = () => {
           </section>
         </div>
 
-        {/* Right Preview Area */}
-        <div className="flex-1 overflow-auto">
-          <div 
-            ref={previewRef}
-            className={`preview-container bg-white p-12 shadow-lg rounded-2xl min-h-full flex flex-col gap-[${style.lineSpacing}px]`}
-            style={{ 
-              gap: `${style.lineSpacing}px`, 
-              textAlign: style.alignment,
-              paddingBottom: '100px'
-            }}
-          >
-            {lyricsData.length > 0 ? (
-              lyricsData.map((line, lineIdx) => (
-                <div key={lineIdx} className={`flex flex-wrap ${style.alignment === 'center' ? 'justify-center' : style.alignment === 'right' ? 'justify-end' : 'justify-start'} gap-x-2`}>
-                  {line.units.map((unit, unitIdx) => (
-                    <div key={unitIdx} className="inline-flex flex-col items-center">
-                      {style.pinyin.show && (
-                        <span 
-                          style={{ 
-                            fontSize: `${style.pinyin.fontSize}px`, 
-                            color: style.pinyin.color,
-                            fontWeight: style.pinyin.fontWeight,
-                            visibility: unit.jyutping ? 'visible' : 'hidden'
+        {/* Right Preview Area - 独立滚动 */}
+        <div className="flex-1 overflow-hidden" style={{ display: 'flex', flexDirection: 'column' }}>
+          <div className="preview-scroll-area">
+            <div
+              ref={previewRef}
+              className="preview-container p-12 min-h-full flex flex-col"
+              style={{
+                gap: `${style.lineSpacing}px`,
+                textAlign: style.alignment,
+                paddingBottom: '100px'
+              }}
+            >
+              {lyricsData.length > 0 ? (
+                lyricsData.map((line, lineIdx) => {
+                  const isEmpty = isEmptyLine(line);
+                  return (
+                    <div
+                      key={lineIdx}
+                      className="lyric-line"
+                      style={{
+                        animationDelay: `${lineIdx * 0.05}s`,
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        justifyContent: style.alignment === 'center' ? 'center' : style.alignment === 'right' ? 'flex-end' : 'flex-start',
+                        gap: '8px',
+                        minHeight: isEmpty ? '20px' : 'auto'
+                      }}
+                    >
+                      {/* 音频播放按钮 - 空行不显示 */}
+                      {!isEmpty && (
+                        <button
+                          onClick={() => speakFromLine(lineIdx)}
+                          className="audio-btn no-print"
+                          style={{
+                            flexShrink: 0,
+                            width: '32px',
+                            height: '32px',
+                            borderRadius: '50%',
+                            border: 'none',
+                            background: playingLine === lineIdx ? 'var(--color-jade)' : 'var(--color-mist)',
+                            color: playingLine === lineIdx ? 'white' : 'var(--color-charcoal)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            transition: 'all 0.2s ease',
+                            marginTop: style.pinyin.show ? `${style.pinyin.fontSize + 4}px` : '0'
                           }}
-                          className="leading-none mb-1"
+                          title={playingLine === lineIdx ? '停止朗读' : '从此行开始朗读'}
                         >
-                          {unit.jyutping || '\u00A0'}
-                        </span>
+                          {playingLine === lineIdx ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                              <rect x="6" y="4" width="4" height="16" />
+                              <rect x="14" y="4" width="4" height="16" />
+                            </svg>
+                          ) : (
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M11 5L6 9H2v6h4l5 4V5z" />
+                              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                            </svg>
+                          )}
+                        </button>
                       )}
-                      <span 
-                        style={{ 
-                          fontSize: `${style.lyric.fontSize}px`, 
-                          color: style.lyric.color,
-                          fontWeight: style.lyric.fontWeight
-                        }}
-                        className="leading-none py-1"
-                      >
-                        {unit.char}
-                      </span>
-                      {style.homophone.show && (
-                        <span 
-                          style={{ 
-                            fontSize: `${style.homophone.fontSize}px`, 
-                            color: style.homophone.color,
-                            fontWeight: style.homophone.fontWeight,
-                            visibility: unit.homophone ? 'visible' : 'hidden'
-                          }}
-                          className="leading-none mt-1 opacity-80"
-                        >
-                          {unit.homophone || '\u00A0'}
-                        </span>
-                      )}
+                      {/* 空行占位符 */}
+                      {isEmpty && <div style={{ width: '32px', flexShrink: 0 }} className="no-print" />}
+
+                      {/* 歌词内容 */}
+                      <div style={{ textAlign: style.alignment }}>
+                        {line.units.map((unit, unitIdx) => (
+                          <div
+                            key={unitIdx}
+                            className={`lyric-unit ${playingLine === lineIdx && playingUnit === unitIdx ? 'speaking' : ''}`}
+                            style={{
+                              display: 'inline-block',
+                              verticalAlign: 'top',
+                              margin: '0 4px',
+                              transition: 'all 0.2s ease',
+                              cursor: unit.char.trim() && !/^[\p{P}\p{S}]$/u.test(unit.char) ? 'pointer' : 'default'
+                            }}
+                            onClick={() => speakChar(unit.char)}
+                            title={unit.char.trim() && !/^[\p{P}\p{S}]$/u.test(unit.char) ? '点击发音' : ''}
+                          >
+                            {style.pinyin.show && (
+                              <div
+                                className="lyric-pinyin"
+                                style={{
+                                  fontSize: `${style.pinyin.fontSize}px`,
+                                  color: playingLine === lineIdx && playingUnit === unitIdx ? '#c53030' : style.pinyin.color,
+                                  fontWeight: style.pinyin.fontWeight,
+                                  visibility: unit.jyutping ? 'visible' : 'hidden',
+                                  textAlign: 'center',
+                                  marginBottom: '2px',
+                                  transition: 'color 0.2s ease'
+                                }}
+                              >
+                                {unit.jyutping || '\u00A0'}
+                              </div>
+                            )}
+                            <div
+                              className="lyric-char"
+                              style={{
+                                fontSize: `${style.lyric.fontSize}px`,
+                                color: playingLine === lineIdx && playingUnit === unitIdx ? '#c53030' : style.lyric.color,
+                                fontWeight: style.lyric.fontWeight,
+                                textAlign: 'center',
+                                transition: 'color 0.2s ease',
+                                transform: playingLine === lineIdx && playingUnit === unitIdx ? 'scale(1.1)' : 'scale(1)'
+                              }}
+                            >
+                              {unit.char}
+                            </div>
+                            {style.homophone.show && (
+                              <div
+                                className="lyric-homophone"
+                                style={{
+                                  fontSize: `${style.homophone.fontSize}px`,
+                                  color: playingLine === lineIdx && playingUnit === unitIdx ? '#c53030' : style.homophone.color,
+                                  fontWeight: style.homophone.fontWeight,
+                                  visibility: unit.homophone ? 'visible' : 'hidden',
+                                  textAlign: 'center',
+                                  marginTop: '2px',
+                                  transition: 'color 0.2s ease'
+                                }}
+                              >
+                                {unit.homophone || '\u00A0'}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  ))}
+                  );
+                })
+              ) : (
+                <div className="empty-state h-full flex flex-col items-center justify-center gap-4 mt-20">
+                  <svg className="w-24 h-24" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"></path>
+                  </svg>
+                  <div className="text-center">
+                    <p className="text-lg font-medium mb-1">预览区域</p>
+                    <p className="text-sm">请在左侧输入歌词并点击生成注音</p>
+                  </div>
                 </div>
-              ))
-            ) : (
-              <div className="h-full flex flex-col items-center justify-center text-slate-300 gap-4 mt-20">
-                <svg className="w-20 h-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                </svg>
-                <p className="text-lg font-medium">预览区域：请输入歌词并生成注音</p>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </div>
       </main>
 
-      {/* Footer Info */}
-      <footer className="no-print bg-white border-t px-6 py-4 text-center text-slate-400 text-sm">
-        <p>© 2024 粤韵歌词 - 助力粤语音乐学习 | 基于 Gemini AI 提供解析支持</p>
+      {/* Footer */}
+      <footer className="app-footer no-print px-6 py-4 text-center text-sm">
+        <p>© 2024 粤韵歌词 — 助力粤语音乐学习 · Powered by Gemini AI</p>
       </footer>
     </div>
   );
